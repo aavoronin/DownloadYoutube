@@ -31,7 +31,7 @@ def download_urls(urls, download_folder=BASE_DOWNLOAD_FOLDER):
 
     # FIX: Use fallback format and handle missing JS runtime gracefully
     ydl_opts = {
-        "format": "best[ext=mp4]/best",  # Fallback to any best format if mp4 not available
+        "format": "bestvideo+bestaudio/best",  # Fallback to any best format if mp4 not available
         "outtmpl": os.path.join(download_folder, "%(title)s [%(height)sp].%(ext)s"),  # Add resolution number (e.g., 1080p, 720p) to filename
         "cookies_from_browser": "chrome",  # Change to "firefox", "edge", etc. if needed
         # js_runtimes as dict (yt-dlp 2024+), but will gracefully degrade if none installed
@@ -122,7 +122,7 @@ def download_playlist(playlist_url, base_folder=BASE_DOWNLOAD_FOLDER, retries=10
             "quiet": False,
             "cookies_from_browser": "chrome",  # Added for auth
             "js_runtimes": {"deno": {}, "node": {}, "quickjs": {}},  # FIXED: dict format
-            "format": "best[ext=mp4]/best",  # Fallback format
+            "format": "bestvideo+bestaudio/best",  # Fallback format
             "retries": 3,
         }
 
@@ -186,7 +186,7 @@ if __name__ == "__main__":
         #"https://www.youtube.com/watch?v=A6l45B4Ffgc",
         #"https://www.youtube.com/watch?v=LpFzaPkHCqc",
         #"https://www.youtube.com/watch?v=TreQuklDBFM",
-        #"https://www.youtube.com/watch?v=a-yuXz_uV30",
+        "https://www.youtube.com/watch?v=a-yuXz_uV30",
         "https://www.youtube.com/watch?v=01TJisrKhLs",
         "",
         "",
@@ -210,10 +210,12 @@ if __name__ == "__main__":
         #"https://www.youtube.com/watch?list=PLhLKc18P9YOAGdtSpB3y7WMkjJbi7dva_",
         #https://www.youtube.com/watch?list=PLS-oDvHudZ8awjshEFprtlM6W95ciMqHf",
         #"https://www.youtube.com/watch?lisst=PL0AYtrUw-NRQkrV0vscqAJvfvBnVwOP9_",
-        "",
-        "",
-        "",
-        "",
+        "https://www.youtube.com/watch?v=ap_Hi93gwEk&list=PLS-oDvHudZ8aNH366nz0FMHhKoE5TqWjm",
+        "https://www.youtube.com/watch?v=jA8DO6Pfwcw&list=PLnQL3JwXMDv2KIGiLad6rPw_21mBfCwT4",
+        "https://www.youtube.com/watch?v=VL8Gga15ILU&list=PLeAdpmiY-mCd-vxbnizG0qAibIRZaNJyZ",
+        "https://www.youtube.com/watch?v=P5jG5RMokdk&list=PLL1ih-rtU13vKf5IaQgnBsMirqVzUK9tX",
+        "https://www.youtube.com/watch?v=cbzHuL_UT8Y&list=PLD7svyKaquTkJqKrJTc71V1ffNyZngck6",
+        "https://www.youtube.com/watch?v=zVLnZh5opG8&list=PLL1ih-rtU13vWqtljKYcp8q3j-fd9J9hg",
     ]:
         if not playlist_url:
             continue
