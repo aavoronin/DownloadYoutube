@@ -266,8 +266,10 @@ def download_playlist(playlist_url, base_folder=BASE_DOWNLOAD_FOLDER, retries=10
 def download_transcripts_for_videos(search_requests, save_folder, max_videos=20):
     """
     Downloads transcripts for videos found in search requests.
-    Identifies up to `max_videos` videos, downloads individual transcripts,
-    and creates a combined transcript file in the specified format.
+    Identifies up to `max_videos` videos, downloads individual transcripts for EACH
+    language separately (ru, en), handles missing languages gracefully, and creates
+    a combined transcript file that includes every successfully downloaded language.
+    Skips downloading if the transcript for a language already exists.
     """
     os.makedirs(save_folder, exist_ok=True)
 
@@ -336,80 +338,122 @@ def download_transcripts_for_videos(search_requests, save_folder, max_videos=20)
             safe_title = safe_filename(title)
             print(f"\n[{index}/{len(unique_videos)}] Processing transcript for: {safe_title}")
 
-            transcript_content = "No transcript available."
-            successful_lang = None
+            # Collect transcripts for EVERY successfully downloaded language
+            downloaded_transcripts = {}
 
             for lang in languages_to_try:
-                individual_file_path = os.path.join(save_folder, f"{safe_title}_{video_id}_{lang}.srt")
+                print(f"  -> Checking '{lang}' transcript...")
+
+                # Check if it already exists locally
+                expected_path = os.path.join(save_folder, f"{safe_title}_{video_id}.{lang}.srt")
+                resolved_path = expected_path
+
+                if not os.path.exists(resolved_path):
+                    # Fallback scan for variants like .en-orig.srt or if yt-dlp named it slightly differently
+                    prefix = f"{safe_title}_{video_id}."
+                    candidates = [f for f in os.listdir(save_folder)
+                                  if f.startswith(prefix) and f.endswith(".srt") and f".{lang}" in f]
+                    if candidates:
+                        resolved_path = os.path.join(save_folder, candidates[0])
+
+                if resolved_path and os.path.exists(resolved_path):
+                    print(f"  ℹ️ '{lang}' transcript already exists. Loading from file.")
+                    try:
+                        with open(resolved_path, "r", encoding="utf-8") as f:
+                            downloaded_transcripts[lang] = f.read()
+                    except Exception as e:
+                        print(f"  ⚠️ Error reading existing '{lang}' transcript: {e}")
+                    continue  # Skip downloading since we already have it
+
+                print(f"  -> Attempting to download '{lang}' transcript...")
 
                 ydl_opts_sub = {
                     "skip_download": True,
                     "writesubtitles": True,
                     "writeautomaticsub": True,
-                    "subtitleslangs": [lang],
+                    "subtitleslangs": [lang],  # Download ONE language at a time
                     "subtitlesformat": "srt",
-                    "outtmpl": individual_file_path,
+                    "outtmpl": os.path.join(save_folder, f"{safe_title}_{video_id}.%(ext)s"),
                     "cookies_from_browser": "chrome",
                     "js_runtimes": {"deno": {}, "node": {}, "quickjs": {}},
+                    "retries": 3,
+                    "fragment_retries": 3,
+                    "no_check_certificate": True,
                     "quiet": True,
                     "no_warnings": True,
                 }
 
                 max_retries = 3
-                lang_success = False
-
                 for attempt in range(1, max_retries + 1):
                     try:
                         with yt_dlp.YoutubeDL(ydl_opts_sub) as ydl:
                             ydl.download([url])
 
-                        if os.path.exists(individual_file_path):
-                            with open(individual_file_path, "r", encoding="utf-8") as f:
-                                content = f.read()
+                        # Locate the file yt-dlp actually created.
+                        resolved_path = expected_path
+                        if not os.path.exists(resolved_path):
+                            prefix = f"{safe_title}_{video_id}."
+                            candidates = [f for f in os.listdir(save_folder)
+                                          if f.startswith(prefix) and f.endswith(".srt") and f".{lang}" in f]
+                            resolved_path = os.path.join(save_folder, candidates[0]) if candidates else None
 
-                            # If this is the first successful language, use it for combined transcript
-                            if successful_lang is None:
-                                transcript_content = content
-                                successful_lang = lang
-
-                            lang_success = True
+                        if resolved_path and os.path.exists(resolved_path):
+                            with open(resolved_path, "r", encoding="utf-8") as f:
+                                downloaded_transcripts[lang] = f.read()
                             print(f"  ✅ '{lang}' transcript downloaded and saved individually.")
-                            break
+                        else:
+                            print(f"  ℹ️ '{lang}' transcript not available for this video.")
+                        break  # done with this language (success or missing) → next language
+
                     except Exception as e:
                         err_str = str(e).lower()
+
+                        # Missing subtitles for this language → gracefully move on
                         if "no subtitle" in err_str or "not found" in err_str or "unavailable" in err_str or "no subtitles for the requested languages" in err_str:
-                            print(f"  ℹ️ '{lang}' transcript not available. Moving to next language.")
+                            print(f"  ℹ️ '{lang}' transcript not available for this video. Moving to next language.")
                             break
 
                         if "429" in err_str or "too many requests" in err_str:
                             print(f"  ⚠️ HTTP 429 Too Many Requests for '{lang}' (Attempt {attempt}/{max_retries}).")
                             if attempt < max_retries:
-                                delay = 5 * attempt
+                                delay = 10 * attempt  # Exponential backoff: 10s, 20s, 30s
                                 print(f"  💡 Waiting {delay} seconds before retrying '{lang}'...")
                                 time.sleep(delay)
                             else:
-                                print(f"  ❌ Max retries reached for '{lang}' due to rate limiting. Moving to next language.")
+                                print(
+                                    f"  ❌ Max retries reached for '{lang}' due to rate limiting. Moving to next language.")
                                 break
+                        elif "sign in to confirm" in err_str or "authentication" in err_str or "bot" in err_str:
+                            print(f"  ❌ YouTube requires authentication. Skipping '{lang}'.")
+                            break
+                        elif "no video formats found" in err_str or "no supported javascript runtime" in err_str:
+                            print(f"  ❌ Format extraction failed (likely missing JS runtime). Skipping '{lang}'.")
+                            break
                         else:
                             print(f"  ❌ Transcript download error for '{lang}': {e}")
                             break
 
-                # Add a small delay between languages to be safe
-                if lang == "ru" and len(languages_to_try) > 1:
-                    time.sleep(1)
+                # Small pause between language requests for the same video
+                time.sleep(2)
 
-            if successful_lang:
-                print(f"  ✅ Using '{successful_lang}' transcript for combined file.")
-            else:
-                print(f"  ⚠️ No transcript found for: {safe_title}")
-
-            # Write to combined transcript in the exact requested format
+            # Write combined entry: include EVERY successfully downloaded language
             combined_file.write(f"video url: {url}\n")
             combined_file.write(f"video title: {title}\n")
-            combined_file.write(f"{transcript_content}\n")
+
+            if downloaded_transcripts:
+                for lang in languages_to_try:
+                    if lang in downloaded_transcripts:
+                        combined_file.write(f"transcript ({lang}):\n")
+                        combined_file.write(downloaded_transcripts[lang].strip() + "\n\n")
+            else:
+                combined_file.write("No transcript available.\n")
+
             combined_file.write("=========================\n")
 
-            time.sleep(2)  # Avoid rate limits between requests
+            # Deliberate delay between videos to avoid triggering rate limits
+            if index < len(unique_videos):
+                print("⏳ Waiting 5 seconds before next video to avoid rate limits...")
+                time.sleep(5)
 
     print(f"\n✅ Finished. Combined transcript saved to: {combined_transcript_path}")
 
@@ -417,36 +461,71 @@ def download_transcripts_for_videos(search_requests, save_folder, max_videos=20)
 if __name__ == "__main__":
     # Download specific videos
     video_urls = [
-        "https://www.youtube.com/watch?v=v4YTsdDXBKM"
-
+        "https://www.youtube.com/watch?v=v4YTsdDXBKM",
+        "https://www.youtube.com/watch?v=8hpSMnCwCxY",
     ]
     download_urls(video_urls)
 
     for playlist_url in [
-        #"https://www.youtube.com/watch?v=JXBAkOvAu5A&list=PLE1NBPwaJdCDlp3RqO4tW3LzYw6nVtTv3",
+        # "https://www.youtube.com/watch?v=JXBAkOvAu5A&list=PLE1NBPwaJdCDlp3RqO4tW3LzYw6nVtTv3",
         "",
         ""
     ]:
         if not playlist_url:
             continue
-        # Download a playlist into a subfolder with the playlist title
-        # playlist_url = "https://www.youtube.com/playlist?list=PLWf6TEjiiuIAouvMboDNw8Uo3EN8O5-2n"
-        # playlist_url = "https://www.youtube.com/playlist?list=PLWf6TEjiiuIAouvMboDNw8Uo3EN8O5-2n"
         download_playlist(playlist_url)
 
     # ---------------------------------------------
-    # NEW: Loop over list for downloading transcripts only
+    # Loop over list for downloading transcripts only
     # ---------------------------------------------
     transcript_urls = [
-        #"https://www.youtube.com/watch?v=jTDSP7KBavI"
+        # "https://www.youtube.com/watch?v=jTDSP7KBavI"
     ]
-    print("\n--- Starting Transcript Downloads ---")
-    download_transcripts_only(transcript_urls, os.path.join(BASE_DOWNLOAD_FOLDER, "transcripts"))
+    if transcript_urls:
+        print("\n--- Starting Specific Transcript Downloads ---")
+        download_transcripts_only(transcript_urls, os.path.join(BASE_DOWNLOAD_FOLDER, "transcripts"))
 
-    search_urls = [
-        "https://www.youtube.com/results?search_query=Python+Interview+&sp=EgIYAg%253D%253D",
+    # ---------------------------------------------
+    # NEW: Parse search configs and download transcripts per category
+    # ---------------------------------------------
+    search_configs = [
+        #"https://www.youtube.com/results?search_query=Python+Interview+&sp=EgIYAg%253D%253D|50|python",
+        #"https://www.youtube.com/results?search_query=Data+Engineer+Interview+&sp=EgIYAg%253D%253D|60|date_engineering",
+        #"https://www.youtube.com/results?search_query=Spark+Interview+&sp=EgIYAg%253D%253D|30|spark",
+        #"https://www.youtube.com/results?search_query=Azure+Interview+&sp=EgIYAg%253D%253D|50|azure",
+        #"https://www.youtube.com/results?search_query=Data+Modeling+Interview+&sp=EgIYAg%253D%253D|50|data_modeling",
+        "https://www.youtube.com/results?search_query=dbt+Interview+&sp=EgIYAg%253D%253D|50|dbt",
+        "https://www.youtube.com/results?search_query=Developer+soft+skills+Interview+&sp=EgIYAg%253D%253D|50|soft_skills",
+        "https://www.youtube.com/results?search_query=Developer+Behavioral+Interview+&sp=EgIYAg%253D%253D|50|Developer",
+        "https://www.youtube.com/results?search_query=running+large+ai+models+on+lessmempory+|50|ai_low_mem",
+        "",
+        "",
     ]
-    print("\n--- Starting Transcript Downloads ---")
-    download_transcripts_for_videos(search_urls, os.path.join(BASE_DOWNLOAD_FOLDER, r"transcripts\python_interview"), max_videos=20)
+
+    print("\n--- Starting Search & Transcript Downloads ---")
+    for config in search_configs:
+        # Ignore empty list elements
+        if not config or not config.strip():
+            continue
+
+        # Parse the configuration string: "URL|max_videos|folder_name"
+        parts = config.split("|")
+        if len(parts) == 3:
+            search_url = parts[0].strip()
+            max_vids = int(parts[1].strip())
+            folder_name = parts[2].strip()
+        else:
+            # Fallback for backward compatibility or malformed strings
+            search_url = config.strip()
+            max_vids = 50
+            folder_name = "default"
+
+        target_folder = os.path.join(BASE_DOWNLOAD_FOLDER, "transcripts", folder_name)
+        print(f"\nProcessing search: {search_url}")
+        print(f"Target folder: {target_folder}")
+        print(f"Max videos: {max_vids}")
+
+        # Pass the search URL as a single-item list to the function
+        download_transcripts_for_videos([search_url], target_folder, max_videos=max_vids)
 
 # AI-103 DP-700 DP-600 DP-750 AI-300 AI-104
