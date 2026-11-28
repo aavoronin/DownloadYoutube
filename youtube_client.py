@@ -2,6 +2,10 @@ import yt_dlp
 import os
 import time
 import re
+import cv2
+import numpy as np
+import shutil
+from PIL import Image, ImageDraw, ImageFont
 
 
 def safe_filename(name):
@@ -9,6 +13,451 @@ def safe_filename(name):
     return re.sub(r'[\\/:*?"<>|]', '', name).strip()
 
 
+# ---------------------------------------------
+# Helper functions from the second project
+# ---------------------------------------------
+FRAME_SECONDS = 2.0
+PRINT_EVERY_N_FRAMES = 50
+USE_DECLARED_RATIOS = True
+
+FONT_CANDIDATES = [
+    r"C:\Windows\Fonts\arial.ttf",
+    r"C:\Windows\Fonts\segoeui.ttf",
+    r"C:\Windows\Fonts\consola.ttf",
+    r"C:\Windows\Fonts\times.ttf",
+    r"C:\Windows\Fonts\calibri.ttf",
+]
+
+
+def parse_srt_file(srt_path: str):
+    """Parse SRT/TXT subtitle file into list of (start_sec, end_sec, text) tuples."""
+    print(f"DEBUG: Parsing subtitle file: {srt_path}")
+    subtitles = []
+    try:
+        with open(srt_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        print(f"DEBUG: Read {len(content)} bytes from subtitle file.")
+    except Exception as e:
+        print(f"WARNING: Could not read subtitle file {srt_path}: {e}")
+        return subtitles
+
+    # Split by blank lines to get individual subtitle blocks
+    blocks = re.split(r'\n\s*\n', content.strip())
+    print(f"DEBUG: Found {len(blocks)} blocks in subtitle file.")
+
+    for i, block in enumerate(blocks):
+        lines = block.strip().split('\n')
+        if len(lines) < 3:
+            continue
+
+        # Parse timestamp line (format: 00:00:00,800 --> 00:00:06,120)
+        timestamp_line = lines[1].strip()
+        match = re.match(r'(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})', timestamp_line)
+        if not match:
+            continue
+
+        start_str, end_str = match.groups()
+
+        def parse_timestamp(ts):
+            h, m, rest = ts.split(':')
+            s, ms = rest.split(',')
+            return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
+
+        start_sec = parse_timestamp(start_str)
+        end_sec = parse_timestamp(end_str)
+
+        # Text is everything after the timestamp line
+        text = ' '.join(line.strip() for line in lines[2:] if line.strip())
+
+        if text:
+            subtitles.append((start_sec, end_sec, text))
+            if i < 5:  # Print first 5 parsed entries for verification
+                print(f"DEBUG: Parsed subtitle {i}: {start_sec:.2f}s --> {end_sec:.2f}s : '{text[:60]}...'")
+
+    # Sort by start time
+    subtitles.sort(key=lambda x: x[0])
+    print(f"DEBUG: Successfully parsed {len(subtitles)} subtitle entries.")
+    return subtitles
+
+
+def get_subtitles_for_interval(subtitles, t_start, t_end):
+    """Get all subtitle texts that intersect with the time interval [t_start, t_end].
+    Concatenate them with space."""
+    texts = []
+    for sub_start, sub_end, text in subtitles:
+        # Intersection: subtitle overlaps with interval
+        if sub_start < t_end and sub_end > t_start:
+            texts.append(text)
+    return ' '.join(texts)
+
+
+def find_font_path():
+    """Find a suitable font file that supports Cyrillic."""
+    for font_path in FONT_CANDIDATES:
+        if os.path.isfile(font_path):
+            print(f"DEBUG: Found valid font at: {font_path}")
+            return font_path
+    print("WARNING: No suitable font found in candidates. Subtitles will NOT be rendered.")
+    return None
+
+
+def find_max_font_size(text, max_width, max_height, font_path, padding=4):
+    """Binary search for the maximum font size that fits the text within the given area."""
+    if not text:
+        return 10
+
+    available_width = max_width - 2 * padding
+    available_height = max_height - 2 * padding
+
+    if available_width <= 0 or available_height <= 0:
+        return 10
+
+    lo, hi = 8, 300
+    best_size = 10
+
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        try:
+            font = ImageFont.truetype(font_path, mid)
+        except Exception:
+            hi = mid - 1
+            continue
+
+        words = text.split()
+        lines = []
+        current_line = []
+
+        for word in words:
+            test_line = ' '.join(current_line + [word])
+            try:
+                left, top, right, bottom = font.getbbox(test_line)
+                line_width = right - left
+            except Exception:
+                # Fallback for older Pillow versions
+                line_width = font.getsize(test_line)[0]
+
+            if line_width <= available_width:
+                current_line.append(word)
+            else:
+                if current_line:
+                    lines.append(' '.join(current_line))
+                current_line = [word]
+
+        if current_line:
+            lines.append(' '.join(current_line))
+
+        if not lines:
+            lines = [text]
+
+        # Calculate total height
+        try:
+            _, top, _, bottom = font.getbbox("Ay")
+            line_height = (bottom - top) * 1.2
+        except Exception:
+            line_height = mid * 1.2
+
+        total_height = len(lines) * line_height
+
+        # Check if fits
+        if total_height <= available_height:
+            fits = True
+            for line in lines:
+                try:
+                    left, top, right, bottom = font.getbbox(line)
+                    line_width = right - left
+                except Exception:
+                    line_width = font.getsize(line)[0]
+                if line_width > available_width:
+                    fits = False
+                    break
+
+            if fits:
+                best_size = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        else:
+            hi = mid - 1
+
+    return best_size
+
+
+def render_frame_with_subtitles(video_frame, subtitle_text, tw, th, font_path):
+    """Render video frame with subtitles in the bottom 20%."""
+    print(f"DEBUG render: tw={tw}, th={th}, text='{subtitle_text[:50]}...'")
+
+    if not subtitle_text:
+        return cv2.resize(video_frame, (tw, th), interpolation=cv2.INTER_LINEAR)
+
+    # Create output frame
+    output = np.zeros((th, tw, 3), dtype=np.uint8)
+
+    # Top 80% for video
+    video_height = int(th * 0.8)
+    resized_video = cv2.resize(video_frame, (tw, video_height), interpolation=cv2.INTER_LINEAR)
+    output[0:video_height, :] = resized_video
+
+    # Bottom 20% for subtitles (white background)
+    subtitle_height = th - video_height
+    output[video_height:th, :] = 255  # White background (BGR: 255, 255, 255)
+
+    if subtitle_text and font_path:
+        try:
+            # Convert BGR to RGB for PIL
+            output_rgb = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(output_rgb)
+            draw = ImageDraw.Draw(pil_img)
+
+            # Find max font size
+            font_size = find_max_font_size(subtitle_text, tw, subtitle_height, font_path, padding=8)
+            print(f"DEBUG render: Calculated font size: {font_size}")
+            font = ImageFont.truetype(font_path, font_size)
+
+            # Wrap text
+            words = subtitle_text.split()
+            lines = []
+            current_line = []
+            available_width = tw - 16
+
+            for word in words:
+                test_line = ' '.join(current_line + [word])
+                try:
+                    left, top, right, bottom = font.getbbox(test_line)
+                    line_width = right - left
+                except Exception:
+                    line_width = font.getsize(test_line)[0]
+
+                if line_width <= available_width:
+                    current_line.append(word)
+                else:
+                    if current_line:
+                        lines.append(' '.join(current_line))
+                    current_line = [word]
+
+            if current_line:
+                lines.append(' '.join(current_line))
+
+            if not lines:
+                lines = [subtitle_text]
+
+            # Calculate total text height
+            try:
+                _, top, _, bottom = font.getbbox("Ay")
+                line_height = (bottom - top) * 1.2
+            except Exception:
+                line_height = font_size * 1.2
+
+            total_height = len(lines) * line_height
+
+            # Center text vertically in the subtitle area
+            y_start = video_height + (subtitle_height - total_height) // 2
+
+            # Draw each line centered horizontally
+            for i, line in enumerate(lines):
+                try:
+                    left, top, right, bottom = font.getbbox(line)
+                    line_width = right - left
+                except Exception:
+                    line_width = font.getsize(line)[0]
+
+                x = (tw - line_width) // 2
+                y = int(y_start + i * line_height)
+                # Black text (0, 0, 0) on White background
+                draw.text((x, y), line, fill=(0, 0, 0), font=font)
+                print(f"DEBUG render: Drew line '{line}' at x={x}, y={y}")
+
+            # Convert back to BGR
+            output = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+            print("DEBUG render: Subtitle rendered successfully to frame.")
+        except Exception as e:
+            print(f"WARNING: Could not render subtitles: {e}")
+            import traceback
+            traceback.print_exc()
+
+    return output
+
+
+def format_timestamp(seconds: float) -> str:
+    """float seconds -> HH:MM:SS.sss"""
+    ms_total = int(round(max(0.0, seconds) * 1000.0))
+    hours, ms_total = divmod(ms_total, 3_600_000)
+    minutes, ms_total = divmod(ms_total, 60_000)
+    secs, ms = divmod(ms_total, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{ms:03d}"
+
+
+def choose_target_size(w: int, h: int, target_size=None):
+    """Pick target size. If target_size provided, use it based on orientation."""
+    if target_size is not None:
+        if w > h:  # horizontal
+            tw = target_size
+            th = round(target_size * h / w)
+        elif h > w:  # vertical
+            th = target_size
+            tw = round(target_size * w / h)
+        else:  # square
+            tw = target_size
+            th = target_size
+
+        # Ensure even dimensions for video encoding
+        tw = tw + (tw % 2)
+        th = th + (th % 2)
+
+        return (tw, th), f"custom {tw}x{th}", w / h
+
+    # Original logic
+    src_ratio = w / h
+    if USE_DECLARED_RATIOS:
+        candidates = [(720, 480, 4.0 / 3.0, "4:3"),
+                      (720, 576, 16.0 / 9.0, "16:9")]
+    else:
+        candidates = [(720, 480, 720 / 480, "4:3"),
+                      (720, 576, 720 / 576, "16:9")]
+    best = min(candidates, key=lambda c: abs(src_ratio - c[2]))
+    return (best[0], best[1]), best[3], src_ratio
+
+
+def process_video(input_path: str, frame_seconds: float = FRAME_SECONDS, target_size=None, subtitle_path=None,
+                  output_name: str = None) -> None:
+    print("=" * 78)
+    print(f"Input : {input_path}")
+    if target_size is not None:
+        print(f"Target size override: {target_size}")
+    if subtitle_path is not None:
+        print(f"Subtitle file: {subtitle_path}")
+
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        print(f"Error: Could not open {input_path}")
+        return
+
+    try:
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        if fps <= 0:
+            fps = 30.0
+            print("Warning: source FPS unknown - assuming 30.0")
+
+        duration = total_frames / fps if fps > 0 else 0.0
+
+        (tw, th), ratio_name, src_ratio = choose_target_size(w, h, target_size)
+        out_fps = max(1, int(round(1.0 / frame_seconds)))
+        repeat_count = max(1, round(frame_seconds * out_fps))
+
+        print(f"Size  : {w}x{h} (ratio {src_ratio:.4f}) -> {tw}x{th} [{ratio_name}]")
+        print(f"Source: fps={fps:.6f}  duration={format_timestamp(duration)}  frames={total_frames}")
+        print(f"Output: fps={out_fps}  slide length={frame_seconds}s  repeat={repeat_count}x")
+        print("-" * 78)
+
+        # Parse subtitles if provided
+        subtitles = []
+        if subtitle_path:
+            subtitles = parse_srt_file(subtitle_path)
+            print(f"DEBUG: Loaded {len(subtitles)} subtitle entries")
+        else:
+            print("DEBUG: No subtitle path provided or file not found.")
+
+        font_path = find_font_path()
+        if subtitles and not font_path:
+            print("WARNING: Subtitles exist but no font found. They will be skipped.")
+        elif font_path:
+            print(f"DEBUG: Using font for rendering: {font_path}")
+
+        out_dir = os.path.dirname(input_path)
+        base = os.path.splitext(os.path.basename(input_path))[0]
+        if output_name:
+            final_output_path = os.path.join(out_dir, output_name)
+        else:
+            final_output_path = os.path.join(out_dir, base + "_short.mp4")
+
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(final_output_path, fourcc, out_fps, (tw, th))
+
+        if not writer.isOpened():
+            print("Error: Could not open video writer")
+            return
+
+        # Calculate target frame indices for sampling
+        target_frame_indices = [0]
+        next_target_time = frame_seconds
+        frame_idx = 0
+
+        while frame_idx < total_frames:
+            t = frame_idx / fps
+            if t + 1e-6 >= next_target_time:
+                target_frame_indices.append(frame_idx)
+                next_target_time += frame_seconds
+            frame_idx += 1
+
+        if total_frames > 0 and target_frame_indices[-1] != total_frames - 1:
+            target_frame_indices.append(total_frames - 1)
+
+        print(f"Extracting {len(target_frame_indices)} frames...")
+
+        # Extract and write frames
+        for i, target_idx in enumerate(target_frame_indices):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
+            ret, frame = cap.read()
+
+            if not ret:
+                print(f"Warning: Could not read frame {target_idx}")
+                continue
+
+            # Get subtitle text for this frame's interval
+            t_current = target_idx / fps
+            t_next = t_current + frame_seconds
+            subtitle_text = ""
+            if subtitles:
+                subtitle_text = get_subtitles_for_interval(subtitles, t_current, t_next)
+
+            # Print first 10 frames' subtitle status for debugging
+            if i < 10:
+                print(
+                    f"DEBUG: Frame {i} (t={t_current:.2f} to {t_next:.2f}) -> subtitle_text: '{subtitle_text[:80]}...'")
+
+            # Render frame with subtitles
+            if subtitle_text and font_path:
+                print(f"DEBUG: Rendering frame {i} with subtitles...")
+                resized = render_frame_with_subtitles(frame, subtitle_text, tw, th, font_path)
+            else:
+                if subtitles and not subtitle_text:
+                    pass  # Silent, normal for gaps
+                elif subtitles and not font_path:
+                    print("DEBUG: Skipping subtitle render because font_path is None")
+
+                resized = cv2.resize(frame, (tw, th), interpolation=cv2.INTER_LINEAR)
+
+            for _ in range(repeat_count):
+                writer.write(resized)
+
+            if i % PRINT_EVERY_N_FRAMES == 0:
+                t = target_idx / fps
+                print(f"{format_timestamp(t)} {target_idx}", flush=True)
+
+        writer.release()
+        cap.release()
+
+        print("-" * 78)
+        print(f"Saved : {final_output_path}")
+        print(f"Output duration: {format_timestamp(len(target_frame_indices) * frame_seconds)}")
+
+    except Exception as e:
+        print(f"Error processing {input_path}: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if 'cap' in locals():
+            cap.release()
+        if 'writer' in locals():
+            writer.release()
+
+
+# ---------------------------------------------
+# YouTube Client Class
+# ---------------------------------------------
 class YouTubeClient:
     def __init__(self, base_download_folder=r"D:\youtube_downloads"):
         self.base_download_folder = base_download_folder
@@ -461,3 +910,102 @@ class YouTubeClient:
                     time.sleep(5)
 
         print(f"\n✅ Finished. Combined transcript saved to: {combined_transcript_path}")
+
+    # ---------------------------------------------
+    # 5. Method to generate video summary with subtitles
+    # ---------------------------------------------
+    def generate_video_summary(
+        self,
+        url: str,
+        frame_seconds: float = FRAME_SECONDS,
+        output_path: str = None,
+        target_size: int = 1280
+    ):
+        """
+        Downloads video and transcripts, then generates a summarized video
+        with subtitles using the specified frame_seconds and target_size.
+        Relies on download_urls and download_transcripts_only to handle downloads.
+        """
+        print(f"Starting video summary generation for: {url}")
+
+        # 1. Get video info to determine filenames
+        ydl_opts_info = {
+            "quiet": True,
+            "extract_flat": False,
+            "cookies_from_browser": "chrome",
+            "js_runtimes": {"deno": {}, "node": {}, "quickjs": {}},
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as e:
+            print(f"❌ Failed to extract video info: {e}")
+            return
+
+        title = info.get("title", "video")
+        video_id = info.get("id", "unknown")
+        safe_title = safe_filename(title)
+
+        # 2. Download video using existing method (handles resume/skip if exists)
+        self.download_urls([url], self.base_download_folder)
+
+        # 3. Download transcripts using existing method (handles retries/delays)
+        transcript_folder = os.path.join(self.base_download_folder, "transcripts")
+        self.download_transcripts_only([url], transcript_folder)
+
+        # 4. Locate the downloaded video file
+        video_path = None
+        for f in os.listdir(self.base_download_folder):
+            if f.startswith(safe_title) and (f.endswith(".mp4") or f.endswith(".mkv") or f.endswith(".webm")):
+                video_path = os.path.join(self.base_download_folder, f)
+                break
+
+        if not video_path or not os.path.exists(video_path):
+            print("❌ Could not find downloaded video file.")
+            return
+
+        print(f"✅ Video ready at: {video_path}")
+
+        # 5. Locate the downloaded transcript file (check for 'ru' or 'en')
+        found_lang = None
+        transcript_path = None
+        for lang in ["ru", "en"]:
+            for f in os.listdir(transcript_folder):
+                if f.startswith(safe_title) and f".{lang}" in f and f.endswith(".srt"):
+                    transcript_path = os.path.join(transcript_folder, f)
+                    found_lang = lang
+                    break
+            if found_lang:
+                break
+
+        if found_lang:
+            print(f"✅ Found '{found_lang}' transcript at: {transcript_path}")
+        else:
+            print("⚠️ No transcripts found. Proceeding without subtitles.")
+
+        # 6. Create processed video
+        base_name = os.path.splitext(os.path.basename(video_path))[0]
+        output_name = f"{base_name}_short_{found_lang if found_lang else 'no_sub'}_{target_size}.mp4"
+        temp_output_path = os.path.join(self.base_download_folder, output_name)
+
+        print(f"Processing video to: {temp_output_path}")
+        process_video(
+            input_path=video_path,
+            frame_seconds=frame_seconds,
+            target_size=target_size,
+            subtitle_path=transcript_path,
+            output_name=output_name
+        )
+
+        # 7. Move to optional output path
+        if output_path and os.path.exists(temp_output_path):
+            if os.path.isdir(output_path):
+                final_dest = os.path.join(output_path, output_name)
+            else:
+                final_dest = output_path
+
+            try:
+                shutil.move(temp_output_path, final_dest)
+                print(f"✅ Moved processed video to: {final_dest}")
+            except Exception as e:
+                print(f"❌ Failed to move video: {e}")

@@ -8,6 +8,12 @@ if __name__ == "__main__":
 
     yt_client = YouTubeClient()
 
+    summary_urls = [
+        "https://www.youtube.com/watch?v=rPGJhrunbxo"
+    ]
+    for url in summary_urls:
+        yt_client.generate_video_summary(url, 2, None, None)
+
     # Download specific videos
     video_urls = [
         # "https://www.youtube.com/watch?v=v4YTsdDXBKM",
@@ -33,7 +39,8 @@ if __name__ == "__main__":
     transcript_urls = [
         # "https://www.youtube.com/watch?v=jTDSP7KBavI",
         # "https://www.youtube.com/watch?v=uBWI-sniRt8",
-        "https://www.youtube.com/watch?v=6tzQj4YyQyw"
+        "https://www.youtube.com/watch?v=6tzQj4YyQyw",
+        "https://www.youtube.com/watch?v=rPGJhrunbxo"
     ]
     if transcript_urls:
         print("\n--- Starting Specific Transcript Downloads ---")
