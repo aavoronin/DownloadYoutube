@@ -12,7 +12,7 @@ if __name__ == "__main__":
         "https://www.youtube.com/watch?v=rPGJhrunbxo"
     ]
     for url in summary_urls:
-        yt_client.generate_video_summary(url, 2, None, None)
+        yt_client.generate_video_summary(url, 2, None, 1080, "en")
 
     # Download specific videos
     video_urls = [

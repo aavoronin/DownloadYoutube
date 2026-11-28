@@ -305,16 +305,12 @@ def choose_target_size(w: int, h: int, target_size=None):
 
         return (tw, th), f"custom {tw}x{th}", w / h
 
-    # Original logic
-    src_ratio = w / h
-    if USE_DECLARED_RATIOS:
-        candidates = [(720, 480, 4.0 / 3.0, "4:3"),
-                      (720, 576, 16.0 / 9.0, "16:9")]
-    else:
-        candidates = [(720, 480, 720 / 480, "4:3"),
-                      (720, 576, 720 / 576, "16:9")]
-    best = min(candidates, key=lambda c: abs(src_ratio - c[2]))
-    return (best[0], best[1]), best[3], src_ratio
+    # If target_size is None, keep original dimensions.
+    # render_frame_with_subtitles will add space for subtitles in the bottom 20%
+    # without changing the width of the video.
+    tw = w + (w % 2)
+    th = h + (h % 2)
+    return (tw, th), "original", w / h
 
 
 def process_video(input_path: str, frame_seconds: float = FRAME_SECONDS, target_size=None, subtitle_path=None,
@@ -915,11 +911,12 @@ class YouTubeClient:
     # 5. Method to generate video summary with subtitles
     # ---------------------------------------------
     def generate_video_summary(
-        self,
-        url: str,
-        frame_seconds: float = FRAME_SECONDS,
-        output_path: str = None,
-        target_size: int = 1280
+            self,
+            url: str,
+            frame_seconds: float = FRAME_SECONDS,
+            output_path: str = None,
+            target_size: int = None,
+            priority_language: str = "ru"
     ):
         """
         Downloads video and transcripts, then generates a summarized video
@@ -949,9 +946,8 @@ class YouTubeClient:
         # 2. Download video using existing method (handles resume/skip if exists)
         self.download_urls([url], self.base_download_folder)
 
-        # 3. Download transcripts using existing method (handles retries/delays)
-        transcript_folder = os.path.join(self.base_download_folder, "transcripts")
-        self.download_transcripts_only([url], transcript_folder)
+        # 3. Download transcripts into the SAME folder as the video
+        self.download_transcripts_only([url], self.base_download_folder)
 
         # 4. Locate the downloaded video file
         video_path = None
@@ -966,17 +962,30 @@ class YouTubeClient:
 
         print(f"✅ Video ready at: {video_path}")
 
-        # 5. Locate the downloaded transcript file (check for 'ru' or 'en')
+        # 5. Locate the downloaded transcript file with priority_language support
         found_lang = None
         transcript_path = None
-        for lang in ["ru", "en"]:
-            for f in os.listdir(transcript_folder):
-                if f.startswith(safe_title) and f".{lang}" in f and f.endswith(".srt"):
-                    transcript_path = os.path.join(transcript_folder, f)
-                    found_lang = lang
+
+        # Check priority language first
+        if priority_language:
+            for f in os.listdir(self.base_download_folder):
+                if f.startswith(safe_title) and f".{priority_language}" in f and f.endswith(".srt"):
+                    transcript_path = os.path.join(self.base_download_folder, f)
+                    found_lang = priority_language
                     break
-            if found_lang:
-                break
+
+        # If not found, check other supported languages
+        if not found_lang:
+            for lang in ["ru", "en"]:
+                if lang == priority_language:
+                    continue
+                for f in os.listdir(self.base_download_folder):
+                    if f.startswith(safe_title) and f".{lang}" in f and f.endswith(".srt"):
+                        transcript_path = os.path.join(self.base_download_folder, f)
+                        found_lang = lang
+                        break
+                if found_lang:
+                    break
 
         if found_lang:
             print(f"✅ Found '{found_lang}' transcript at: {transcript_path}")
@@ -985,7 +994,8 @@ class YouTubeClient:
 
         # 6. Create processed video
         base_name = os.path.splitext(os.path.basename(video_path))[0]
-        output_name = f"{base_name}_short_{found_lang if found_lang else 'no_sub'}_{target_size}.mp4"
+        size_str = str(target_size) if target_size is not None else "orig"
+        output_name = f"{base_name}_short_{found_lang if found_lang else 'no_sub'}_{size_str}.mp4"
         temp_output_path = os.path.join(self.base_download_folder, output_name)
 
         print(f"Processing video to: {temp_output_path}")
