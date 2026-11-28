@@ -947,22 +947,10 @@ class YouTubeClient:
         self.download_urls([url], self.base_download_folder)
 
         # 3. Download transcripts into the SAME folder as the video
+        # This method attempts to download all supported languages independently
         self.download_transcripts_only([url], self.base_download_folder)
 
-        # 4. Locate the downloaded video file
-        video_path = None
-        for f in os.listdir(self.base_download_folder):
-            if f.startswith(safe_title) and (f.endswith(".mp4") or f.endswith(".mkv") or f.endswith(".webm")):
-                video_path = os.path.join(self.base_download_folder, f)
-                break
-
-        if not video_path or not os.path.exists(video_path):
-            print("❌ Could not find downloaded video file.")
-            return
-
-        print(f"✅ Video ready at: {video_path}")
-
-        # 5. Locate the downloaded transcript file with priority_language support
+        # 4. Identify what transcripts were actually downloaded
         found_lang = None
         transcript_path = None
 
@@ -974,23 +962,32 @@ class YouTubeClient:
                     found_lang = priority_language
                     break
 
-        # If not found, check other supported languages
+        # If priority language was not downloaded, check the other supported language
         if not found_lang:
-            for lang in ["ru", "en"]:
-                if lang == priority_language:
-                    continue
-                for f in os.listdir(self.base_download_folder):
-                    if f.startswith(safe_title) and f".{lang}" in f and f.endswith(".srt"):
-                        transcript_path = os.path.join(self.base_download_folder, f)
-                        found_lang = lang
-                        break
-                if found_lang:
+            other_lang = "en" if priority_language == "ru" else "ru"
+            for f in os.listdir(self.base_download_folder):
+                if f.startswith(safe_title) and f".{other_lang}" in f and f.endswith(".srt"):
+                    transcript_path = os.path.join(self.base_download_folder, f)
+                    found_lang = other_lang
                     break
 
         if found_lang:
-            print(f"✅ Found '{found_lang}' transcript at: {transcript_path}")
+            print(f"✅ Using '{found_lang}' transcript at: {transcript_path}")
         else:
-            print("⚠️ No transcripts found. Proceeding without subtitles.")
+            print("⚠️ No transcripts found or downloaded. Proceeding without subtitles.")
+
+        # 5. Locate the downloaded video file
+        video_path = None
+        for f in os.listdir(self.base_download_folder):
+            if f.startswith(safe_title) and (f.endswith(".mp4") or f.endswith(".mkv") or f.endswith(".webm")):
+                video_path = os.path.join(self.base_download_folder, f)
+                break
+
+        if not video_path or not os.path.exists(video_path):
+            print("❌ Could not find downloaded video file.")
+            return
+
+        print(f"✅ Video ready at: {video_path}")
 
         # 6. Create processed video
         base_name = os.path.splitext(os.path.basename(video_path))[0]
